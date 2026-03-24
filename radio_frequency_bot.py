@@ -1,10 +1,9 @@
-import asyncio
 import json
 import logging
 import os
 import random
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -16,7 +15,9 @@ from discord.ext import commands, tasks
 CONFIG_FILE = Path("config.json")
 DEFAULT_MIN_FREQ = 100.0
 DEFAULT_MAX_FREQ = 999.9
-DEFAULT_TIME = "10:00"  # horario local do servidor onde o bot estiver rodando
+DEFAULT_TIME = "10:00"
+MAX_HISTORY = 10
+RECENT_BLOCK_COUNT = 5
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,7 +33,9 @@ class GuildConfig:
     min_freq: float = DEFAULT_MIN_FREQ
     max_freq: float = DEFAULT_MAX_FREQ
     last_frequency: Optional[float] = None
-    last_sent_date: Optional[str] = None  # YYYY-MM-DD em horario local do bot
+    last_sent_date: Optional[str] = None
+    avoid_repetition: bool = False
+    frequency_history: list[float] = field(default_factory=list)
 
 
 class ConfigStore:
@@ -95,6 +98,11 @@ class RadioBot(commands.Bot):
         if self.user:
             logger.info("Logado como %s (%s)", self.user, self.user.id)
 
+    def add_to_history(self, config: GuildConfig, frequency: float) -> None:
+        config.last_frequency = frequency
+        config.frequency_history.append(frequency)
+        config.frequency_history = config.frequency_history[-MAX_HISTORY:]
+
     @tasks.loop(minutes=1)
     async def daily_frequency_task(self) -> None:
         now = datetime.now().astimezone()
@@ -114,8 +122,7 @@ class RadioBot(commands.Bot):
             channel = guild.get_channel(config.channel_id)
             if channel is None:
                 try:
-                    fetched = await guild.fetch_channel(config.channel_id)
-                    channel = fetched
+                    channel = await guild.fetch_channel(config.channel_id)
                 except discord.DiscordException:
                     logger.exception("Nao consegui acessar o canal %s da guild %s", config.channel_id, guild.id)
                     continue
@@ -123,7 +130,7 @@ class RadioBot(commands.Bot):
             if not isinstance(channel, discord.abc.Messageable):
                 continue
 
-            frequency = self.generate_frequency(config.min_freq, config.max_freq, config.last_frequency)
+            frequency = self.generate_frequency(config)
             message = f"📻 **Frequência de hoje:** `{frequency:.1f}`"
 
             try:
@@ -132,7 +139,7 @@ class RadioBot(commands.Bot):
                 logger.exception("Falha ao enviar frequencia para a guild %s", guild.id)
                 continue
 
-            config.last_frequency = frequency
+            self.add_to_history(config, frequency)
             config.last_sent_date = current_date
             self.config_store.update_guild(guild.id, config)
             logger.info("Frequencia %.1f enviada para guild %s", frequency, guild.id)
@@ -142,20 +149,41 @@ class RadioBot(commands.Bot):
         await self.wait_until_ready()
 
     @staticmethod
-    def generate_frequency(min_freq: float, max_freq: float, previous: Optional[float]) -> float:
+    def generate_frequency(config: GuildConfig) -> float:
+        min_freq = config.min_freq
+        max_freq = config.max_freq
+
         if min_freq >= max_freq:
             raise ValueError("min_freq deve ser menor que max_freq")
 
-        for _ in range(50):
+        blocked_values: set[float] = set()
+        if config.avoid_repetition:
+            blocked_values.update(config.frequency_history[-RECENT_BLOCK_COUNT:])
+        elif config.last_frequency is not None:
+            blocked_values.add(config.last_frequency)
+
+        for _ in range(100):
             value = round(random.uniform(min_freq, max_freq), 1)
-            if previous is None or value != previous:
+            if value not in blocked_values:
                 return value
 
-        # fallback improvavel
         return round(random.uniform(min_freq, max_freq), 1)
 
 
 bot = RadioBot()
+
+
+def user_is_admin(interaction: discord.Interaction) -> bool:
+    return bool(interaction.user.guild_permissions.administrator)
+
+
+def get_configured_channel(guild: discord.Guild, config: GuildConfig) -> Optional[discord.abc.Messageable]:
+    if not config.channel_id:
+        return None
+    channel = guild.get_channel(config.channel_id)
+    if channel and isinstance(channel, discord.abc.Messageable):
+        return channel
+    return None
 
 
 @bot.tree.command(name="configurar_radio", description="Define o canal, horario e faixa de frequencia diaria")
@@ -176,7 +204,7 @@ async def configurar_radio(
         await interaction.response.send_message("Esse comando so funciona em servidor.", ephemeral=True)
         return
 
-    if not interaction.user.guild_permissions.administrator:
+    if not user_is_admin(interaction):
         await interaction.response.send_message("Voce precisa ser administrador para configurar o bot.", ephemeral=True)
         return
 
@@ -202,40 +230,36 @@ async def configurar_radio(
             "Configuração salva.\n"
             f"Canal: {canal.mention}\n"
             f"Horario: `{config.hour_minute}`\n"
-            f"Faixa: `{config.min_freq:.1f}` ate `{config.max_freq:.1f}`"
+            f"Faixa: `{config.min_freq:.1f}` ate `{config.max_freq:.1f}`\n"
+            f"Evitar repeticao: `{'ligado' if config.avoid_repetition else 'desligado'}`"
         ),
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="frequencia_agora", description="Envia a frequencia do dia imediatamente")
+@bot.tree.command(name="frequencia_agora", description="Envia uma frequencia extra imediatamente")
 async def frequencia_agora(interaction: discord.Interaction) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("Esse comando so funciona em servidor.", ephemeral=True)
         return
 
-    if not interaction.user.guild_permissions.administrator:
+    if not user_is_admin(interaction):
         await interaction.response.send_message("Voce precisa ser administrador para usar esse comando.", ephemeral=True)
         return
 
     config = bot.config_store.get_guild(interaction.guild.id)
-    if not config.channel_id:
+    channel = get_configured_channel(interaction.guild, config)
+    if channel is None:
         await interaction.response.send_message("Configure primeiro com `/configurar_radio`.", ephemeral=True)
         return
 
-    channel = interaction.guild.get_channel(config.channel_id)
-    if channel is None:
-        await interaction.response.send_message("Nao encontrei o canal configurado. Configure novamente.", ephemeral=True)
-        return
-
-    frequency = bot.generate_frequency(config.min_freq, config.max_freq, config.last_frequency)
+    frequency = bot.generate_frequency(config)
     await channel.send(f"📻 **Frequência extra:** `{frequency:.1f}`")
-
-    config.last_frequency = frequency
+    bot.add_to_history(config, frequency)
     bot.config_store.update_guild(interaction.guild.id, config)
 
     await interaction.response.send_message(
-        f"Enviei uma frequencia extra em {channel.mention}: `{frequency:.1f}`",
+        f"Enviei uma frequencia extra em <#{config.channel_id}>: `{frequency:.1f}`",
         ephemeral=True,
     )
 
@@ -251,15 +275,145 @@ async def ver_radio(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Ainda nao ha configuracao salva para este servidor.", ephemeral=True)
         return
 
-    channel_mention = f"<#{config.channel_id}>"
+    ultima = f"{config.last_frequency:.1f}" if config.last_frequency is not None else "nenhuma"
     await interaction.response.send_message(
         (
-            f"Canal: {channel_mention}\n"
+            f"Canal: <#{config.channel_id}>\n"
             f"Horario: `{config.hour_minute}`\n"
             f"Faixa: `{config.min_freq:.1f}` ate `{config.max_freq:.1f}`\n"
-            f"Ultima frequencia: `{config.last_frequency if config.last_frequency is not None else 'nenhuma'}`\n"
-            f"Ultimo envio: `{config.last_sent_date if config.last_sent_date else 'nunca'}`"
+            f"Ultima frequencia: `{ultima}`\n"
+            f"Ultimo envio: `{config.last_sent_date if config.last_sent_date else 'nunca'}`\n"
+            f"Evitar repeticao: `{'ligado' if config.avoid_repetition else 'desligado'}`"
         ),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="fixar_frequencia", description="Define e envia uma frequencia manualmente")
+@app_commands.describe(frequencia="Frequencia manual que sera enviada no canal configurado")
+async def fixar_frequencia(
+    interaction: discord.Interaction,
+    frequencia: app_commands.Range[float, 1, 9999],
+) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("Esse comando so funciona em servidor.", ephemeral=True)
+        return
+
+    if not user_is_admin(interaction):
+        await interaction.response.send_message("Voce precisa ser administrador para usar esse comando.", ephemeral=True)
+        return
+
+    config = bot.config_store.get_guild(interaction.guild.id)
+    channel = get_configured_channel(interaction.guild, config)
+    if channel is None:
+        await interaction.response.send_message("Configure primeiro com `/configurar_radio`.", ephemeral=True)
+        return
+
+    value = round(float(frequencia), 1)
+    if value < config.min_freq or value > config.max_freq:
+        await interaction.response.send_message(
+            f"A frequencia precisa estar dentro da faixa configurada: `{config.min_freq:.1f}` ate `{config.max_freq:.1f}`.",
+            ephemeral=True,
+        )
+        return
+
+    await channel.send(f"📻 **Frequência oficial definida:** `{value:.1f}`")
+    bot.add_to_history(config, value)
+    bot.config_store.update_guild(interaction.guild.id, config)
+
+    await interaction.response.send_message(
+        f"Frequencia `{value:.1f}` fixada e enviada em <#{config.channel_id}>.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="historico_frequencias", description="Mostra o historico recente de frequencias")
+async def historico_frequencias(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("Esse comando so funciona em servidor.", ephemeral=True)
+        return
+
+    config = bot.config_store.get_guild(interaction.guild.id)
+    if not config.frequency_history:
+        await interaction.response.send_message("Ainda nao ha historico de frequencias neste servidor.", ephemeral=True)
+        return
+
+    history_lines = [f"- `{freq:.1f}`" for freq in reversed(config.frequency_history)]
+    await interaction.response.send_message(
+        "📜 **Historico de frequências:**\n" + "\n".join(history_lines),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="evitar_repeticao", description="Liga ou desliga o bloqueio de repeticao de frequencias recentes")
+@app_commands.describe(ativar="Escolha ligado ou desligado")
+async def evitar_repeticao(interaction: discord.Interaction, ativar: bool) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("Esse comando so funciona em servidor.", ephemeral=True)
+        return
+
+    if not user_is_admin(interaction):
+        await interaction.response.send_message("Voce precisa ser administrador para usar esse comando.", ephemeral=True)
+        return
+
+    config = bot.config_store.get_guild(interaction.guild.id)
+    config.avoid_repetition = ativar
+    bot.config_store.update_guild(interaction.guild.id, config)
+
+    status = "ligado" if ativar else "desligado"
+    await interaction.response.send_message(
+        f"Sistema de evitar repeticao agora esta **{status}**.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="frequencia_evento", description="Envia uma frequencia com mensagem especial de evento")
+@app_commands.describe(
+    titulo="Titulo curto do evento",
+    frequencia="Opcional. Se nao informar, o bot sorteia automaticamente",
+)
+async def frequencia_evento(
+    interaction: discord.Interaction,
+    titulo: str,
+    frequencia: Optional[app_commands.Range[float, 1, 9999]] = None,
+) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("Esse comando so funciona em servidor.", ephemeral=True)
+        return
+
+    if not user_is_admin(interaction):
+        await interaction.response.send_message("Voce precisa ser administrador para usar esse comando.", ephemeral=True)
+        return
+
+    config = bot.config_store.get_guild(interaction.guild.id)
+    channel = get_configured_channel(interaction.guild, config)
+    if channel is None:
+        await interaction.response.send_message("Configure primeiro com `/configurar_radio`.", ephemeral=True)
+        return
+
+    if frequencia is None:
+        value = bot.generate_frequency(config)
+    else:
+        value = round(float(frequencia), 1)
+        if value < config.min_freq or value > config.max_freq:
+            await interaction.response.send_message(
+                f"A frequencia precisa estar dentro da faixa configurada: `{config.min_freq:.1f}` ate `{config.max_freq:.1f}`.",
+                ephemeral=True,
+            )
+            return
+
+    mensagem = (
+        f"✨ **{titulo}**\n"
+        f"A sintonia da noite foi liberada.\n"
+        f"📻 **Frequência do evento:** `{value:.1f}`"
+    )
+    await channel.send(mensagem)
+
+    bot.add_to_history(config, value)
+    bot.config_store.update_guild(interaction.guild.id, config)
+
+    await interaction.response.send_message(
+        f"Mensagem de evento enviada em <#{config.channel_id}> com a frequencia `{value:.1f}`.",
         ephemeral=True,
     )
 
