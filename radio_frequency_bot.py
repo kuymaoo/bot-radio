@@ -233,11 +233,21 @@ class RadioBot(commands.Bot):
             blocked_values.add(config.last_frequency)
 
         for _ in range(120):
-            value = round(random.uniform(min_freq, max_freq), 2)
+            min_cents = int(round(min_freq * 100))
+        max_cents = int(round(max_freq * 100))
+        if min_cents >= max_cents:
+            raise ValueError("min_freq deve ser menor que max_freq")
+
+        available_count = (max_cents - min_cents + 1)
+        if blocked_values and len(blocked_values) >= available_count:
+            blocked_values.clear()
+
+        for _ in range(500):
+            value = random.randint(min_cents, max_cents) / 100
             if value not in blocked_values:
                 return value
 
-        return round(random.uniform(min_freq, max_freq), 2)
+        return random.randint(min_cents, max_cents) / 100
 
 
 bot = RadioBot()
@@ -380,7 +390,7 @@ async def fixar_frequencia(
         return
 
     freq = round(float(frequencia), 2)
-    message = await bot.replace_last_frequency_message(channel, config, f"📻 **Frequência oficial da noite:** `{freq:.1f}`")
+    message = await bot.replace_last_frequency_message(channel, config, f"📻 **Frequência oficial da noite:** `{freq:.2f}`")
     if message is None:
         await interaction.response.send_message("Nao consegui enviar a frequencia. Veja os logs do bot.", ephemeral=True)
         return
@@ -389,7 +399,7 @@ async def fixar_frequencia(
     bot.config_store.update_guild(interaction.guild.id, config)
 
     await interaction.response.send_message(
-        f"Frequencia fixada e enviada em {channel.mention}: `{freq:.1f}`",
+        f"Frequencia fixada e enviada em {channel.mention}: `{freq:.2f}`",
         ephemeral=True,
     )
 
